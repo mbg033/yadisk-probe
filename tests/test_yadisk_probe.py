@@ -1,9 +1,11 @@
 import importlib.util
+import csv
 import io
 import json
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 import urllib.error
 import urllib.parse
@@ -128,6 +130,65 @@ class ApiListingTest(unittest.TestCase):
 
     def test_empty_disk_lists_nothing(self):
         self.assertEqual(self.listed(FakeDisk({"": []}, page_size=10)), [])
+
+
+class ReleaseOnOutput(io.StringIO):
+    def __init__(self, marker, ready):
+        super().__init__()
+        self.marker, self.ready = marker, ready
+
+    def write(self, text):
+        result = super().write(text)
+        if self.marker in text:
+            self.ready.set()
+        return result
+
+
+class ProgressTest(unittest.TestCase):
+    def test_api_listing_reports_while_first_directory_is_still_waiting(self):
+        ready = threading.Event()
+        released = []
+        output = ReleaseOnOutput("Listing: files=0", ready)
+
+        def directory(*args):
+            released.append(ready.wait(2))
+            return [{"Path": "a", "Size": 1}], []
+
+        with mock.patch.object(probe, "list_directory", side_effect=directory), \
+                mock.patch.object(probe, "PROGRESS_SECONDS", 0.01), \
+                mock.patch("sys.stderr", output):
+            entries = probe.list_with_api("access")
+        self.assertEqual(released, [True], "listing must report before the request completes")
+        self.assertEqual(entries, [{"Path": "a", "Size": 1}])
+        self.assertIn("folders done=0, pending=1", output.getvalue())
+        self.assertIn("Listing: files=1, folders done=1, pending=0", output.getvalue())
+
+    def test_probe_reports_while_all_files_are_waiting_and_saves_final_result(self):
+        ready = threading.Event()
+        released = []
+        output = ReleaseOnOutput("0/1 ", ready)
+
+        def check_file(*args):
+            released.append(ready.wait(2))
+            return "OK", ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token.json"
+            probe.save_token(token_file, stored_token(timedelta(days=30)))
+            reports = Path(directory) / "new" / "reports"
+            argv = [str(SCRIPT), "--token-file", str(token_file), "--dir", str(reports)]
+            with mock.patch("sys.argv", argv), mock.patch("sys.stderr", output), \
+                    mock.patch.object(probe, "PROGRESS_SECONDS", 0.01), \
+                    mock.patch.object(probe, "load_listing", return_value=[{"Path": "a", "Size": 1}]), \
+                    mock.patch.object(probe, "probe", side_effect=check_file):
+                probe.main()
+            with (reports / "results.csv").open(newline="") as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual([(row["path"], row["status"]) for row in rows], [("a", "OK")])
+            self.assertTrue((reports / "summary.txt").exists())
+        self.assertEqual(released, [True], "probing must report before the request completes")
+        self.assertIn("0.0 files/s, ETA unknown", output.getvalue())
+        self.assertIn("1/1 OK=1", output.getvalue())
 
 
 class RcloneListingTest(unittest.TestCase):

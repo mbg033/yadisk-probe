@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from collections import Counter, defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -151,14 +151,23 @@ def list_directory(access_token, directory):
 
 def list_with_api(access_token):
     entries = []
+    directories = 0
+    started = last_progress = time.monotonic()
     with ThreadPoolExecutor(LIST_WORKERS) as pool:
         pending = {pool.submit(list_directory, access_token, "")}
         while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            timeout = max(0, PROGRESS_SECONDS - (time.monotonic() - last_progress))
+            done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
             for future in done:
                 files, subdirectories = future.result()
+                directories += 1
                 entries.extend(files)
                 pending |= {pool.submit(list_directory, access_token, path) for path in subdirectories}
+            now = time.monotonic()
+            if now - last_progress >= PROGRESS_SECONDS or not pending:
+                print(f"Listing: files={len(entries)}, folders done={directories}, pending={len(pending)}, "
+                      f"elapsed {(now - started) / 60:.1f} min", file=sys.stderr, flush=True)
+                last_progress = now
     return entries
 
 
@@ -200,6 +209,8 @@ def load_listing(listing, token, lister):
         partial = listing.with_suffix(".partial")
         partial.write_text(json.dumps(entries))
         partial.replace(listing)
+    else:
+        print(f"Loading saved listing from {listing} ...", file=sys.stderr, flush=True)
     return json.loads(listing.read_text())
 
 
@@ -333,6 +344,9 @@ def main():
         sys.exit(f"No token file {args.token_file}; obtain a token with --login first.")
     signal.signal(signal.SIGTERM, signal.default_int_handler)
 
+    args.dir = args.dir.resolve()
+    args.dir.mkdir(parents=True, exist_ok=True)
+    print(f"Reports directory: {args.dir}", file=sys.stderr, flush=True)
     token = load_token(args.token_file)
     entries = load_listing(args.dir / "listing.json", token, args.lister)
     results = args.dir / "results.csv"
@@ -346,7 +360,7 @@ def main():
 
     new_file = not results.exists()
     counts = Counter()
-    started = last_progress = time.time()
+    started = last_progress = time.monotonic()
     stop = None
     pool = ThreadPoolExecutor(args.workers)
     try:
@@ -355,20 +369,26 @@ def main():
             if new_file:
                 writer.writerow(FIELDS)
             futures = {pool.submit(probe, token["access_token"], e["Path"], e["Size"]): e for e in todo}
-            for done, future in enumerate(as_completed(futures), 1):
-                entry = futures[future]
-                state, reason = future.result()
-                counts[state] += 1
-                writer.writerow([state, entry["Path"], entry["Size"], entry.get("Hashes", {}).get("md5", ""),
-                                 reason, time.strftime("%Y-%m-%dT%H:%M:%S")])
-                out.flush()
-                now = time.time()
-                if now - last_progress >= PROGRESS_SECONDS or done == len(todo):
+            pending = set(futures)
+            checked = 0
+            while pending:
+                timeout = max(0, PROGRESS_SECONDS - (time.monotonic() - last_progress))
+                done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+                for future in done:
+                    entry = futures[future]
+                    state, reason = future.result()
+                    counts[state] += 1
+                    checked += 1
+                    writer.writerow([state, entry["Path"], entry["Size"], entry.get("Hashes", {}).get("md5", ""),
+                                     reason, time.strftime("%Y-%m-%dT%H:%M:%S")])
+                    out.flush()
+                now = time.monotonic()
+                if now - last_progress >= PROGRESS_SECONDS or not pending:
                     last_progress = now
-                    rate = done / (now - started)
-                    eta = (len(todo) - done) / rate
-                    print(f"{done}/{len(todo)} " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())) +
-                          f" {rate:.1f} files/s, ETA {eta / 60:.0f} min", file=sys.stderr, flush=True)
+                    rate = checked / max(now - started, 1e-9)
+                    eta = f"{(len(todo) - checked) / rate / 60:.0f} min" if rate else "unknown"
+                    print(f"{checked}/{len(todo)} " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())) +
+                          f" {rate:.1f} files/s, ETA {eta}", file=sys.stderr, flush=True)
     except KeyboardInterrupt:
         print("\nInterrupted; a rerun continues from here.", file=sys.stderr)
     except Unauthorized as error:

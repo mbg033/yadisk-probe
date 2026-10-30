@@ -5,4 +5,5 @@ listing.partial
 results.csv
 summary.txt
 unavailable.txt
+recovered.txt
 __pycache__/

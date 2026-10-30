@@ -285,5 +285,54 @@ class ListingFileTest(unittest.TestCase):
         self.assertEqual(second, self.entries)
 
 
+class RecoveryReportTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.results = self.directory / "results.csv"
+
+    def append_results(self, rows):
+        new_file = not self.results.exists()
+        with self.results.open("a", newline="") as out:
+            writer = csv.writer(out)
+            if new_file:
+                writer.writerow(probe.FIELDS)
+            for path, state in rows:
+                writer.writerow([state, path, 12, "md5", "", "2026-10-29T12:00:00"])
+
+    def report(self, paths):
+        with mock.patch("sys.stderr", io.StringIO()) as output:
+            probe.write_report([{"Path": path, "Size": 12} for path in paths],
+                               self.results, self.directory)
+        return output.getvalue()
+
+    def test_only_previously_unreadable_and_currently_ok_files_are_recovered(self):
+        self.append_results([
+            ("recovered", "UNREADABLE"), ("recovered", "ERROR"), ("recovered", "OK"),
+            ("unreadable-again", "UNREADABLE"), ("unreadable-again", "OK"),
+            ("unreadable-again", "UNREADABLE"),
+            ("error-only", "ERROR"), ("error-only", "OK"), ("always-ok", "OK"),
+            ("absent-from-listing", "UNREADABLE"), ("absent-from-listing", "OK"),
+        ])
+        output = self.report(["recovered", "unreadable-again", "error-only", "always-ok"])
+        self.assertEqual((self.directory / "recovered.txt").read_text(), "12\trecovered\n")
+        self.assertEqual((self.directory / "unavailable.txt").read_text(), "12\tunreadable-again\n")
+        self.assertIn("Recovered (UNREADABLE -> OK): 1 files", output)
+        self.assertIn("Recovered (UNREADABLE -> OK): 1 files", (self.directory / "summary.txt").read_text())
+
+    def test_recovered_file_with_a_new_error_is_removed_from_the_report(self):
+        self.append_results([("a", "UNREADABLE"), ("a", "OK")])
+        self.report(["a"])
+        self.append_results([("a", "ERROR")])
+        output = self.report(["a"])
+        self.assertEqual((self.directory / "recovered.txt").read_text(), "")
+        self.assertIn("Recovered (UNREADABLE -> OK): 0 files", output)
+
+    def test_missing_results_produce_an_empty_recovery_report(self):
+        self.report(["not-checked"])
+        self.assertEqual((self.directory / "recovered.txt").read_text(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -231,10 +231,19 @@ def login(token_file):
 
 
 def latest_status(results):
+    return result_history(results)[0]
+
+
+def result_history(results):
+    status, previously_unreadable = {}, set()
     if not results.exists():
-        return {}
+        return status, previously_unreadable
     with results.open(newline="") as rows:
-        return {row["path"]: row for row in csv.DictReader(rows)}
+        for row in csv.DictReader(rows):
+            status[row["path"]] = row
+            if row["status"] == "UNREADABLE":
+                previously_unreadable.add(row["path"])
+    return status, previously_unreadable
 
 
 def download_link(access_token, path):
@@ -281,11 +290,12 @@ def top_folder(path):
 
 
 def write_report(entries, results, directory):
-    status = latest_status(results)
+    status, previously_unreadable = result_history(results)
     counts = Counter()
     folders = defaultdict(Counter)
     folder_bytes = defaultdict(int)
     unreadable = []
+    recovered = []
     for entry in entries:
         row = status.get(entry["Path"])
         state = row["status"] if row else "NOT CHECKED"
@@ -294,13 +304,20 @@ def write_report(entries, results, directory):
         if state == "UNREADABLE":
             unreadable.append(row)
             folder_bytes[top_folder(entry["Path"])] += entry["Size"]
+        elif state == "OK" and entry["Path"] in previously_unreadable:
+            recovered.append(row)
     unreadable.sort(key=lambda row: row["path"])
     with (directory / "unavailable.txt").open("w") as out:
         for row in unreadable:
             out.write(f"{row['size']}\t{row['path']}\n")
+    recovered.sort(key=lambda row: row["path"])
+    with (directory / "recovered.txt").open("w") as out:
+        for row in recovered:
+            out.write(f"{row['size']}\t{row['path']}\n")
 
     lines = [f"Files: {len(entries)}; " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())),
              f"Unreadable: {len(unreadable)} files, {sum(folder_bytes.values()) / 2**30:.2f} GiB",
+             f"Recovered (UNREADABLE -> OK): {len(recovered)} files; list: {directory / 'recovered.txt'}",
              "",
              f"{'folder':40} {'files':>8} {'checked':>8} {'unreadable':>10} {'GiB':>8}"]
     for folder, folder_counts in sorted(folders.items(), key=lambda item: -item[1]["UNREADABLE"]):
@@ -329,7 +346,7 @@ def parse_arguments(argv):
     parser.add_argument("--lister", choices=("rclone", "api"), default="rclone",
                         help="what lists the files of the disk: rclone, or the REST API of Yandex Disk")
     parser.add_argument("--dir", type=Path, default=Path.cwd(),
-                        help="directory holding listing.json, results.csv, summary.txt and unavailable.txt")
+                        help="directory holding listing.json, results.csv, summary.txt, unavailable.txt and recovered.txt")
     parser.add_argument("--workers", type=int, default=64)
     parser.add_argument("--limit", type=int, help="probe at most this many files")
     return parser.parse_args(argv)
